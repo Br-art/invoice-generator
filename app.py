@@ -2,13 +2,14 @@ import os
 import io
 import json
 import re
+import tempfile
+import subprocess
 from datetime import datetime, date
 from typing import List, Tuple, Optional
 
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.workbook import Workbook
-from fpdf import FPDF
 
 # =========================
 # Fixed cell mapping (template)
@@ -241,13 +242,28 @@ def write_ticket_summary(ws, ticket_items: List[dict]) -> None:
         last = SUMMARY_START_ROW + SUMMARY_MAX_ROWS - 1
         ws[f"E{last}"] = f"{ws[f'E{last}'].value or ''} (+{extra} more)"
 
+# =========================
+# Page setup for PDF export
+# =========================
 def configure_print_settings(ws) -> None:
+    # Expanded print area to include Payment Details
     ws.print_area = "A1:I75"
+
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.orientation = "portrait"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 1
     ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    ws.print_options.horizontalCentered = True
+    ws.print_options.verticalCentered = False
+
+    ws.page_margins.left = 0.15
+    ws.page_margins.right = 0.15
+    ws.page_margins.top = 0.2
+    ws.page_margins.bottom = 0.2
+    ws.page_margins.header = 0.0
+    ws.page_margins.footer = 0.0
 
 # =========================
 # Apply: single-ticket
@@ -340,60 +356,61 @@ def apply_to_workbook_multi(wb: Workbook, big_ticket_text: str, customer: str) -
     return wb
 
 # =========================
-# Pure Python PDF Generator
+# PDF export from Excel file
 # =========================
-def create_pure_pdf(customer: str, items: List[dict]) -> bytes:
-    pdf = FPDF()
-    pdf.add_page()
-    
-    pdf.set_font("helvetica", "B", 20)
-    pdf.cell(0, 10, "INVOICE", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(10)
-    
-    pdf.set_font("helvetica", "", 12)
-    pdf.cell(100, 8, f"Deliver To: {customer}")
-    pdf.cell(90, 8, f"Date: {date.today().strftime('%d %b %Y')}", align="R", new_x="LMARGIN", new_y="NEXT")
-    
-    first_ref = items[0]["ref"] if items else "REFXXX"
-    doc_no = f"{first_ref}{date.today():%d%m%y}"
-    pdf.cell(100, 8, f"Invoice No: {doc_no}", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(10)
-    
-    pdf.set_font("helvetica", "B", 12)
-    pdf.cell(40, 10, "Reference", border="B")
-    pdf.cell(100, 10, "Route", border="B")
-    pdf.cell(50, 10, "Amount", border="B", align="R", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(2)
-    
-    grand_total = 0
-    first_ccy = items[0]["currency"] if items else "ZMW"
-    sym = CURRENCY_SYMBOL.get(first_ccy, "K")
-    
-    pdf.set_font("helvetica", "", 11)
-    for t in items:
-        route_str = ticket_route_string(t["flights"])
-        amt_str = f"{CURRENCY_SYMBOL.get(t['currency'], 'K')}{t['total']:,.2f}"
-        grand_total += t["total"]
-        
-        pdf.cell(40, 10, t["ref"])
-        pdf.cell(100, 10, route_str)
-        pdf.cell(50, 10, amt_str, align="R", new_x="LMARGIN", new_y="NEXT")
-        
-        if t["pax"]:
-            pdf.set_font("helvetica", "I", 10)
-            pax_str = "Passengers: " + ", ".join(t["pax"])
-            pdf.cell(40, 6, "") 
-            pdf.multi_cell(100, 6, pax_str, new_x="LMARGIN", new_y="NEXT")
-            pdf.set_font("helvetica", "", 11)
-            pdf.ln(2)
-            
-    pdf.ln(5)
-    pdf.set_font("helvetica", "B", 14)
-    total_str = f"{sym}{grand_total:,.2f}"
-    pdf.cell(140, 10, "Total Payable:", align="R")
-    pdf.cell(50, 10, total_str, align="R", new_x="LMARGIN", new_y="NEXT")
-    
-    return bytes(pdf.output())
+def get_soffice_path() -> Optional[str]:
+    candidates = [
+        os.environ.get("SOFFICE_PATH", ""),
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        "soffice",
+    ]
+    for path in candidates:
+        if not path:
+            continue
+        if path == "soffice":
+            return path
+        if os.path.exists(path):
+            return path
+    return None
+
+def convert_excel_to_pdf(xlsx_path: str) -> bytes:
+    soffice = get_soffice_path()
+    if not soffice:
+        raise RuntimeError("LibreOffice not found. Install LibreOffice or set SOFFICE_PATH.")
+
+    outdir = tempfile.mkdtemp(prefix="invoice_pdf_")
+
+    cmd = [
+        soffice,
+        "--headless",
+        "--convert-to", "pdf",
+        "--outdir", outdir,
+        xlsx_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        err = result.stderr.strip() or result.stdout.strip() or "PDF conversion failed."
+        raise RuntimeError(err)
+
+    pdf_path = os.path.join(
+        outdir,
+        os.path.splitext(os.path.basename(xlsx_path))[0] + ".pdf"
+    )
+
+    if not os.path.exists(pdf_path):
+        raise RuntimeError("PDF file was not created.")
+
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+
+    if not pdf_bytes:
+        raise RuntimeError("PDF file is empty.")
+
+    return pdf_bytes
 
 # =========================
 # Streamlit UI
@@ -434,8 +451,6 @@ if st.button("Generate Invoice", type="primary"):
     wb = load_workbook(TEMPLATE_PATH)
 
     chunks = split_tickets(ticket_text)
-    items = [parse_one_ticket(c) for c in chunks if c] if len(chunks) >= 2 else [parse_one_ticket(ticket_text)]
-
     if len(chunks) >= 2:
         wb = apply_to_workbook_multi(wb, ticket_text, customer)
     else:
@@ -452,7 +467,14 @@ if st.button("Generate Invoice", type="primary"):
     pdf_error = None
 
     try:
-        pdf_bytes = create_pure_pdf(customer, items)
+        workdir = tempfile.mkdtemp(prefix="invoice_work_")
+        xlsx_path = os.path.join(workdir, f"{base_name}.xlsx")
+
+        with open(xlsx_path, "wb") as f:
+            f.write(excel_bytes)
+
+        pdf_bytes = convert_excel_to_pdf(xlsx_path)
+
     except Exception as e:
         pdf_error = repr(e)
 
