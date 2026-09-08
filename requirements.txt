@@ -1,3 +1,0 @@
-streamlit
-openpyxl
-fpdf2
