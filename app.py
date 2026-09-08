@@ -502,3 +502,5 @@ if st.button("Generate Invoice", type="primary"):
             st.warning(f"PDF not available: {pdf_error}")
 
     save_settings({"last_deliver_to": customer})
+
+# fix
