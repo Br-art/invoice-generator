@@ -10,34 +10,23 @@ from typing import List, Tuple, Optional
 import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.workbook import Workbook
+from openpyxl.styles import Alignment, Border, Side
 
 # =========================
 # Fixed cell mapping (template)
 # =========================
-DELIVER_TO_CELL = "G19"
 DATE_CELL = "I6"
 DOCNO_CELL = "I12"
 
-# Single-ticket cells
-ROUTE_CELL = "E35"
-PRICE_CELL = "I35"
+# Deliver to multi-row block (Rows 18 to 25, Columns G to I)
+DELIVER_TO_START_ROW = 18
+DELIVER_TO_END_ROW = 25
+DELIVER_TO_COL_START = 7  # Column G
+DELIVER_TO_COL_END = 9    # Column I
 
-# Flights (dates) table area
-FLIGHT_START_ROW = 42
-FLIGHT_MAX_ROWS = 40
-
-# Passenger names list
-PASSENGER_LABEL_CELL = "C45"
-PASSENGER_START_ROW = 47
-PASSENGER_MAX_ROWS = 9
-
-# Subtotal / Total
-SUBTOTAL_LABEL_CELL, SUBTOTAL_CELL = "H56", "I56"
-TOTAL_LABEL_CELL, TOTAL_CELL = "H59", "I59"
-
-# Multi-ticket summary
-SUMMARY_START_ROW = 36
-SUMMARY_MAX_ROWS = 10
+# Flight sector rows (E35 to E38 for routes, F35 to F38 for refs, I35 to I38 for prices)
+ROUTE_START_ROW = 35
+ROUTE_END_ROW = 38
 
 # Currency symbols
 CURRENCY_SYMBOL = {
@@ -113,15 +102,29 @@ def pretty_name(slash_name: str) -> str:
 
     last = parts[0].title()
     given_raw = parts[1]
+
+    ch_match = re.search(r'\.CH(\d+)$', given_raw)
+    in_match = re.search(r'\.IN(\d+)$', given_raw)
+
+    suffix_str = ""
+    if ch_match:
+        age = ch_match.group(1)
+        suffix_str = f" {age}yrs"
+        given_raw = re.sub(r'\.CH\d+$', '', given_raw)
+    elif in_match:
+        age = in_match.group(1)
+        suffix_str = f" IN {age}"
+        given_raw = re.sub(r'\.IN\d+$', '', given_raw)
+
     title_map = {
         "MR": "Mr",
         "MS": "Ms",
         "MRS": "Mrs",
-        "MSTR": "Mr",
+        "MSTR": "Mstr",
         "MISS": "Miss",
     }
-    is_inf = ".IN" in slash_name
-    m = re.match(r"^([A-Z]+?)(MR|MS|MRS|MSTR|MISS)?(?:\.IN\d+)?$", given_raw)
+    
+    m = re.match(r"^([A-Z]+?)(MR|MS|MRS|MSTR|MISS)?$", given_raw)
     title = "Mr/Ms"
     given = given_raw.title()
 
@@ -131,30 +134,50 @@ def pretty_name(slash_name: str) -> str:
         if t and t in title_map:
             title = title_map[t]
 
-    return f"{title} {given} {last}" + (" (INF)" if is_inf else "")
+    return f"{title} {given} {last}{suffix_str}"
 
-def parse_passengers(txt: str) -> List[str]:
-    pax: List[str] = []
+def parse_passengers_for_chunk(txt: str) -> List[str]:
+    # Check for group booking headers (e.g. 1.13TAMEDIA*)
+    group_pax = []
+    for line in txt.splitlines():
+        m_group = re.search(r'\b\d+\.(\d+)([A-Z0-9]+)\b', line)
+        if m_group:
+            count_str, name_part = m_group.groups()
+            if count_str.isdigit() and int(count_str) > 1 and name_part.isalpha():
+                group_pax.append(f"{count_str} {name_part.title()} (group {count_str} passengers)")
 
-    for m in re.finditer(r"TICKET ISSUED .*?\s([A-Z]+/[A-Z]+[A-Z\.0-9]*)", txt):
-        pax.append(pretty_name(m.group(1)))
+    if group_pax:
+        return group_pax
 
-    if pax:
-        out, seen = [], set()
-        for p in pax:
-            if p not in seen:
-                seen.add(p)
-                out.append(p)
-        return out
+    pax_raw = []
+    for line in txt.splitlines():
+        m_line = re.match(r"^\s*\d+\.\d+([A-Z]+/[A-Z\.0-9]+)", line)
+        if m_line:
+            pax_raw.append(m_line.group(1))
 
-    for m in re.finditer(r"\d+\.\d+([A-Z]+)/([A-Z]+[A-Z\.0-9]*)", txt):
-        pax.append(pretty_name(m.group(1) + "/" + m.group(2)))
+    if not pax_raw:
+        for m in re.finditer(r"TICKET ISSUED .*?\s([A-Z]+/[A-Z]+[A-Z\.0-9]*)", txt):
+            pax_raw.append(m.group(1))
 
-    out, seen = [], set()
-    for p in pax:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
+    seen_base_names = set()
+    out = []
+
+    for raw in pax_raw:
+        parts = raw.split('/')
+        if len(parts) == 2:
+            last = parts[0].strip().upper()
+            given_part = parts[1].strip().upper()
+            given_clean = re.sub(r'(MR|MS|MRS|MSTR|MISS|\.CH\d+|\.IN\d+)', '', given_part).strip()
+            
+            base_key = f"{last}/{given_clean}"
+            if base_key not in seen_base_names:
+                seen_base_names.add(base_key)
+                out.append(pretty_name(raw))
+        else:
+            formatted = pretty_name(raw)
+            if formatted not in out:
+                out.append(formatted)
+
     return out
 
 def split_tickets(big_text: str) -> List[str]:
@@ -173,7 +196,7 @@ def parse_one_ticket(txt: str) -> dict:
     ref = parse_reference(txt) or "REFXXX"
     ccy, total = parse_total_currency(txt)
     flights = parse_flights(txt)
-    pax = parse_passengers(txt)
+    pax = parse_passengers_for_chunk(txt)
 
     return {
         "ref": ref,
@@ -197,56 +220,197 @@ def ticket_route_string(flights: List[Tuple[str, str]]) -> str:
     return "-".join(chain)
 
 # =========================
-# Excel writers
+# Excel writers & Format Fixes
 # =========================
-def clear_block(ws, start_row: int, rows: int, cols: List[str]) -> None:
-    for r in range(start_row, start_row + rows):
-        for c in cols:
-            ws[f"{c}{r}"] = ""
+def remove_payment_gridlines(ws) -> None:
+    for r in range(63, 72):
+        for col_letter in ['D', 'G']:
+            cell = ws[f'{col_letter}{r}']
+            current_border = cell.border
+            cell.border = Border(
+                left=current_border.left if current_border else None,
+                right=Side(style=None),
+                top=current_border.top if current_border else None,
+                bottom=current_border.bottom if current_border else None
+            )
+
+    for coord in ['D67', 'D68', 'H68', 'I67', 'I68']:
+        cell = ws[coord]
+        curr = cell.border
+        cell.border = Border(
+            left=Side(style=None),
+            right=Side(style=None),
+            top=curr.top if curr else None,
+            bottom=curr.bottom if curr else None
+        )
+
+    for coord in ['E67', 'E68']:
+        cell = ws[coord]
+        cell.border = Border(
+            left=Side(style=None),
+            right=Side(style='thin'),
+            top=Side(style=None),
+            bottom=Side(style=None)
+        )
+
+def write_deliver_to(ws, customer: str) -> None:
+    for r in range(DELIVER_TO_START_ROW, DELIVER_TO_END_ROW + 1):
+        for merged_range in list(ws.merged_cells.ranges):
+            if f"G{r}" in merged_range or f"H{r}" in merged_range or f"I{r}" in merged_range:
+                ws.unmerge_cells(str(merged_range))
+        
+        for c in range(DELIVER_TO_COL_START, DELIVER_TO_COL_END + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.value = ""
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    for r in range(DELIVER_TO_START_ROW, DELIVER_TO_END_ROW + 1):
+        ws.merge_cells(start_row=r, start_column=DELIVER_TO_COL_START, end_row=r, end_column=DELIVER_TO_COL_END)
+
+    chars_per_line = 35 
+    words = customer.strip().split()
+    
+    lines = []
+    current_line = ""
+    for word in words:
+        if current_line:
+            test_line = f"{current_line} {word}"
+        else:
+            test_line = word
+            
+        if len(test_line) <= chars_per_line:
+            current_line = test_line
+        else:
+            lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
+
+    for i, line_text in enumerate(lines[:(DELIVER_TO_END_ROW - DELIVER_TO_START_ROW + 1)]):
+        r = DELIVER_TO_START_ROW + i
+        cell = ws.cell(row=r, column=DELIVER_TO_COL_START)
+        cell.value = line_text
+        cell.alignment = Alignment(wrap_text=True, vertical="top", horizontal="left")
+
+def write_flight_sectors_and_summary(ws, ticket_items: List[dict], adjusted_data: List[tuple]) -> None:
+    for r in range(ROUTE_START_ROW, ROUTE_END_ROW + 1):
+        ws[f"E{r}"] = ""
+        ws[f"F{r}"] = ""
+        ws[f"I{r}"] = ""
+
+    max_slots = ROUTE_END_ROW - ROUTE_START_ROW + 1
+    
+    if len(ticket_items) < max_slots:
+        for idx, t in enumerate(ticket_items):
+            r = ROUTE_START_ROW + idx
+            sym = CURRENCY_SYMBOL.get(t["currency"], "K")
+            ws[f"E{r}"] = ticket_route_string(t["flights"])
+            ws[f"F{r}"] = t["ref"]
+            
+            adj_total, label = adjusted_data[idx] if idx < len(adjusted_data) else (t["total"], "")
+            if label:
+                ws[f"I{r}"] = f"{sym}{adj_total:,.2f} ({label})"
+            else:
+                ws[f"I{r}"] = f"{sym}{adj_total:,.2f}"
+    else:
+        for idx in range(max_slots - 1):
+            r = ROUTE_START_ROW + idx
+            t = ticket_items[idx]
+            sym = CURRENCY_SYMBOL.get(t["currency"], "K")
+            ws[f"E{r}"] = ticket_route_string(t["flights"])
+            ws[f"F{r}"] = t["ref"]
+            
+            adj_total, label = adjusted_data[idx] if idx < len(adjusted_data) else (t["total"], "")
+            if label:
+                ws[f"I{r}"] = f"{sym}{adj_total:,.2f} ({label})"
+            else:
+                ws[f"I{r}"] = f"{sym}{adj_total:,.2f}"
+            
+        overflow_items = ticket_items[max_slots - 1:]
+        r = ROUTE_END_ROW
+        
+        ws[f"E{r}"] = "(+more)"
+        
+        ref_list = [x["ref"] for x in overflow_items]
+        if len(ref_list) > 4:
+            remaining_refs = ", ".join(ref_list[:4]) + ", +"
+        else:
+            remaining_refs = ", ".join(ref_list)
+            
+        ws[f"F{r}"] = remaining_refs
+        
+        overflow_sum = sum(adjusted_data[i][0] for i in range(max_slots - 1, len(adjusted_data))) if len(adjusted_data) >= max_slots else sum(x["total"] for x in overflow_items)
+        first_ccy = overflow_items[0]["currency"] if overflow_items else "ZMW"
+        sym = CURRENCY_SYMBOL.get(first_ccy, "K")
+        ws[f"I{r}"] = f"{sym}{overflow_sum:,.2f}"
 
 def write_flight_dates(ws, ticket_items: List[dict]) -> None:
-    for r in range(FLIGHT_START_ROW, FLIGHT_START_ROW + FLIGHT_MAX_ROWS):
-        ws[f"C{r}"], ws[f"E{r}"] = "", ""
+    for r in range(40, 45):
+        for col_letter in ["B", "C", "D", "E", "F", "G", "H", "I"]:
+            ws[f"{col_letter}{r}"] = ""
 
-    row = FLIGHT_START_ROW
+    all_flights = []
     for t in ticket_items:
-        for route, d in (t["flights"] or [("N/A", "")]):
-            if row >= FLIGHT_START_ROW + FLIGHT_MAX_ROWS:
-                ws[f"C{FLIGHT_START_ROW + FLIGHT_MAX_ROWS - 1}"] = "(+more)"
-                return
-            ws[f"C{row}"] = route
-            ws[f"E{row}"] = d
-            row += 1
+        if t["flights"]:
+            all_flights.extend(t["flights"])
+        else:
+            all_flights.append(("N/A", ""))
+
+    if len(all_flights) > 0:
+        ws["B40"] = "Flight dates:"
+        for idx, (route, d) in enumerate(all_flights[:4]):
+            r = 41 + idx
+            ws[f"B{r}"] = route
+            ws[f"C{r}"] = d
+
+    if len(all_flights) > 4:
+        ws["E40"] = "Flight dates:"
+        for idx, (route, d) in enumerate(all_flights[4:8]):
+            r = 41 + idx
+            ws[f"E{r}"] = route
+            ws[f"F{r}"] = d
+
+    if len(all_flights) > 8:
+        ws["H40"] = "Flight dates:"
+        for idx, (route, d) in enumerate(all_flights[8:11]):
+            r = 41 + idx
+            ws[f"H{r}"] = route
+            ws[f"I{r}"] = d
+        
+        if len(all_flights) > 11:
+            ws["H44"] = "(+more)"
+            ws["I44"] = "(+more)"
 
 def write_passengers(ws, pax: List[str]) -> None:
-    ws[PASSENGER_LABEL_CELL] = "Passengers:"
-    clear_block(ws, PASSENGER_START_ROW, PASSENGER_MAX_ROWS, ["C"])
-    for i, name in enumerate(pax[:PASSENGER_MAX_ROWS]):
-        ws[f"C{PASSENGER_START_ROW + i}"] = name
+    for r in range(45, 56):
+        for col in ["B", "C", "D", "E", "F", "G", "H", "I"]:
+            ws[f"{col}{r}"] = ""
 
-def write_ticket_summary(ws, ticket_items: List[dict]) -> None:
-    for r in range(SUMMARY_START_ROW, SUMMARY_START_ROW + SUMMARY_MAX_ROWS):
-        for c in ["E", "F", "I"]:
-            ws[f"{c}{r}"] = ""
+    if not pax:
+        return
 
-    row = SUMMARY_START_ROW
-    for t in ticket_items[:SUMMARY_MAX_ROWS]:
-        sym = CURRENCY_SYMBOL.get(t["currency"], "K")
-        ws[f"E{row}"] = ticket_route_string(t["flights"])
-        ws[f"F{row}"] = t["ref"]
-        ws[f"I{row}"] = f"{sym}{t['total']:,.2f}"
-        row += 1
+    ws["B45"] = "Passengers:"
+    for idx, name in enumerate(pax[:9]):
+        ws[f"B{46 + idx}"] = name
 
-    extra = max(0, len(ticket_items) - SUMMARY_MAX_ROWS)
-    if extra:
-        last = SUMMARY_START_ROW + SUMMARY_MAX_ROWS - 1
-        ws[f"E{last}"] = f"{ws[f'E{last}'].value or ''} (+{extra} more)"
+    if len(pax) > 9:
+        ws["E45"] = "Passengers:"
+        for idx, name in enumerate(pax[9:18]):
+            ws[f"E{46 + idx}"] = name
+
+    if len(pax) > 18:
+        ws["H45"] = "Passengers:"
+        for idx, name in enumerate(pax[18:26]):
+            ws[f"H{46 + idx}"] = name
+            
+        remaining_count = len(pax) - 26
+        if remaining_count > 0:
+            ws["H54"] = f"+{remaining_count} more"
 
 # =========================
 # Page setup for PDF export
 # =========================
 def configure_print_settings(ws) -> None:
-    # Expanded print area to include Payment Details
     ws.print_area = "A1:I75"
 
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
@@ -266,61 +430,19 @@ def configure_print_settings(ws) -> None:
     ws.page_margins.footer = 0.0
 
 # =========================
-# Apply: single-ticket
+# Apply: single/multi-ticket
 # =========================
-def apply_to_workbook(wb: Workbook, ticket_text: str, customer: str) -> Workbook:
+def apply_to_workbook(wb: Workbook, ticket_text: str, customer: str, adjusted_data: List[tuple]) -> Workbook:
     ws = wb.active
 
-    ref = parse_reference(ticket_text) or "REFXXX"
-    ccy, total = parse_total_currency(ticket_text)
-    flights = parse_flights(ticket_text)
-    pax = parse_passengers(ticket_text)
-
-    sym = CURRENCY_SYMBOL.get(ccy or "ZMW", "K")
-    amount_str = f"{sym}{(total or 0.0):,.2f}"
-
-    ws[DELIVER_TO_CELL] = customer.strip()
-    ws[DATE_CELL] = date.today()
-    ws[DOCNO_CELL] = f"{ref}{date.today():%d%m%y}"
-
-    for row in ws.iter_rows():
-        for cell in row:
-            if isinstance(cell.value, str) and "ABBNWU" in cell.value:
-                cell.value = cell.value.replace("ABBNWU", ref)
-
-    write_flight_dates(ws, [{"flights": flights}])
-
-    if flights:
-        unique_routes = []
-        for r, _ in flights:
-            if r not in unique_routes:
-                unique_routes.append(r)
-        ws[ROUTE_CELL] = " – ".join(unique_routes)
-    else:
-        ws[ROUTE_CELL] = ""
-
-    ws[PRICE_CELL] = amount_str
-    ws[SUBTOTAL_LABEL_CELL] = "Sub Total"
-    ws[TOTAL_LABEL_CELL] = "Total Payable"
-    ws[SUBTOTAL_CELL] = amount_str
-    ws[TOTAL_CELL] = amount_str
-
-    write_passengers(ws, pax)
-    configure_print_settings(ws)
-    return wb
-
-# =========================
-# Apply: multi-ticket
-# =========================
-def apply_to_workbook_multi(wb: Workbook, big_ticket_text: str, customer: str) -> Workbook:
-    ws = wb.active
-
-    chunks = split_tickets(big_ticket_text)
+    chunks = split_tickets(ticket_text)
     items = [parse_one_ticket(c) for c in chunks if c]
+    if not items:
+        items = [parse_one_ticket(ticket_text)]
 
     first_ref = items[0]["ref"] if items else "REFXXX"
     ws[DOCNO_CELL] = f"{first_ref}{date.today():%d%m%y}"
-    ws[DELIVER_TO_CELL] = customer.strip()
+    write_deliver_to(ws, customer)
     ws[DATE_CELL] = date.today()
 
     ref_list = ", ".join([x["ref"] for x in items])
@@ -329,10 +451,7 @@ def apply_to_workbook_multi(wb: Workbook, big_ticket_text: str, customer: str) -
             if isinstance(cell.value, str) and "ABBNWU" in cell.value:
                 cell.value = cell.value.replace("ABBNWU", ref_list)
 
-    ws["E35"] = ""
-    ws["I35"] = ""
-
-    write_ticket_summary(ws, items)
+    write_flight_sectors_and_summary(ws, items, adjusted_data)
     write_flight_dates(ws, items)
 
     union = []
@@ -342,16 +461,17 @@ def apply_to_workbook_multi(wb: Workbook, big_ticket_text: str, customer: str) -
                 union.append(p)
     write_passengers(ws, union)
 
-    grand = sum(t["total"] for t in items)
+    grand = sum(item[0] for item in adjusted_data)
     first_ccy = items[0]["currency"] if items else "ZMW"
     sym = CURRENCY_SYMBOL.get(first_ccy, "K")
     amt = f"{sym}{grand:,.2f}"
 
-    ws[SUBTOTAL_LABEL_CELL] = "Sub Total"
-    ws[TOTAL_LABEL_CELL] = "Total Payable"
-    ws[SUBTOTAL_CELL] = amt
-    ws[TOTAL_CELL] = amt
+    ws["H56"] = "Sub Total"
+    ws["H59"] = "Total Payable"
+    ws["I56"] = amt
+    ws["I59"] = amt
 
+    remove_payment_gridlines(ws)
     configure_print_settings(ws)
     return wb
 
@@ -439,6 +559,61 @@ ticket_text = st.text_area(
     height=280
 )
 
+adjusted_data = []
+
+if ticket_text.strip():
+    chunks = split_tickets(ticket_text)
+    items = [parse_one_ticket(c) for c in chunks if c]
+    if not items:
+        items = [parse_one_ticket(ticket_text)]
+
+    st.markdown("### 📋 Booking Fare Adjustments")
+    
+    for idx, t in enumerate(items):
+        # Determine effective passenger count (if group booking, check group size or len(t['pax']))
+        pax_count = len(t["pax"])
+        for p in t["pax"]:
+            m_grp = re.match(r"^(\d+)\s+", p)
+            if m_grp:
+                pax_count = max(pax_count, int(m_grp.group(1)))
+
+        base_total = t["total"]
+        sym = CURRENCY_SYMBOL.get(t["currency"], "K")
+        ref = t["ref"]
+        
+        if pax_count >= 10:
+            st.warning(f"⚠️ **Booking #{idx+1} (Ref: {ref})** has **{pax_count} passengers** (>= 10). Total Fare: {sym}{base_total:,.2f}")
+            
+            option = st.selectbox(
+                f"Select calculation basis for Booking #{idx+1} ({ref}):",
+                ("100% (Full Fare)", "75% Deposit", "25% Deposit", "Custom Advised Amount"),
+                key=f"opt_{idx}"
+            )
+            
+            if option == "75% Deposit":
+                adj = base_total * 0.75
+                label = "75%"
+            elif option == "25% Deposit":
+                adj = base_total * 0.25
+                label = "25%"
+            elif option == "Custom Advised Amount":
+                adj = st.number_input(
+                    f"Enter advised amount for Booking #{idx+1} ({ref}) [{sym}]:",
+                    min_value=0.0,
+                    value=float(base_total),
+                    step=100.0,
+                    key=f"cust_{idx}"
+                )
+                label = "Custom"
+            else:
+                adj = base_total
+                label = ""
+            
+            adjusted_data.append((adj, label))
+        else:
+            st.info(f"ℹ️ **Booking #{idx+1} (Ref: {ref})** has **{pax_count} passengers** (<= 9). Fare remains at 100% ({sym}{base_total:,.2f}).")
+            adjusted_data.append((base_total, ""))
+
 if st.button("Generate Invoice", type="primary"):
     if not customer.strip():
         st.error("Please enter the Deliver To (customer).")
@@ -449,12 +624,7 @@ if st.button("Generate Invoice", type="primary"):
         st.stop()
 
     wb = load_workbook(TEMPLATE_PATH)
-
-    chunks = split_tickets(ticket_text)
-    if len(chunks) >= 2:
-        wb = apply_to_workbook_multi(wb, ticket_text, customer)
-    else:
-        wb = apply_to_workbook(wb, ticket_text, customer)
+    wb = apply_to_workbook(wb, ticket_text, customer, adjusted_data)
 
     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", customer.strip())
     base_name = f"Invoice_{safe}_{date.today():%Y%m%d}"
@@ -502,5 +672,3 @@ if st.button("Generate Invoice", type="primary"):
             st.warning(f"PDF not available: {pdf_error}")
 
     save_settings({"last_deliver_to": customer})
-
-# fix
