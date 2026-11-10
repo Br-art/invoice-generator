@@ -61,7 +61,7 @@ settings = load_settings()
 # =========================
 def parse_reference(txt: str) -> Optional[str]:
     pattern = re.compile(r"\b(?=[A-Z0-9]{5,6}\b)(?=.*[A-Z])[A-Z0-9]{5,6}\b")
-    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip() and "END OF PNR" not in ln.upper()]
     tail = "\n".join(lines[-12:]) if lines else txt
 
     m_last = None
@@ -150,9 +150,9 @@ def parse_passengers_for_chunk(txt: str) -> List[str]:
         return group_pax
 
     pax_raw = []
+    # Find ALL passenger entries on each line (e.g., 1.1NAME 2.1NAME 3.1NAME on the same line)
     for line in txt.splitlines():
-        m_line = re.match(r"^\s*\d+\.\d+([A-Z]+/[A-Z\.0-9]+)", line)
-        if m_line:
+        for m_line in re.finditer(r"(?:^|\s)\d+\.\d+([A-Z]+/[A-Z\.0-9]+)", line):
             pax_raw.append(m_line.group(1))
 
     if not pax_raw:
@@ -570,7 +570,6 @@ if ticket_text.strip():
     st.markdown("### 📋 Booking Fare Adjustments")
     
     for idx, t in enumerate(items):
-        # Determine effective passenger count (if group booking, check group size or len(t['pax']))
         pax_count = len(t["pax"])
         for p in t["pax"]:
             m_grp = re.match(r"^(\d+)\s+", p)
